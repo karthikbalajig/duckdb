@@ -8,12 +8,15 @@
 
 #pragma once
 
+#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/array.hpp"
 #include "duckdb/common/enums/memory_tag.hpp"
 #include "duckdb/common/file_buffer.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/storage/buffer/block_handle.hpp"
+#include "duckdb/common/typedefs.hpp"
+#include "duckdb/parallel/concurrentqueue.hpp"
 
 namespace duckdb {
 
@@ -31,6 +34,21 @@ struct BufferEvictionNode {
 	bool CanUnload(BlockHandle &handle_p);
 	shared_ptr<BlockHandle> TryGetBlockHandle();
 };
+
+struct S3FifoNode {
+	S3FifoNode() {
+	}
+	S3FifoNode(weak_ptr<BlockHandle> handle);
+
+	//! Weak pointer to the corresponding block handle
+	weak_ptr<BlockHandle> handle;
+	//! Whether or not the block was accessed while in the probationary queue
+	atomic<bool> probationary_access;
+	//! Number of accesses in main queue
+	atomic<uint8_t> main_accesses;
+};
+
+typedef duckdb_moodycamel::ConcurrentQueue<S3FifoNode> fifo_queue_t;
 
 //! The BufferPool is in charge of handling memory management for one or more databases. It defines memory limits
 //! and implements priority eviction among all users of the pool.
@@ -98,6 +116,44 @@ protected:
 	//! Mapping and priority order for the eviction queues
 	const array<idx_t, FILE_BUFFER_TYPE_COUNT> eviction_queue_sizes;
 
+
+	//! Struct for the S3 FIFO queue
+	struct S3FifoQueue {
+	public:
+		S3FifoQueue();
+
+		fifo_queue_t probationary_queue;
+		fifo_queue_t main_queue;
+		fifo_queue_t ghost_queue;
+
+		//! Inserts a new node to the FIFO queue
+		void QueueInsert(BufferEvictionNode &&node);
+		//! Tries to dequeue an element, but only after acquiring the purge queue lock.
+		bool TryDequeueWithLock(BufferEvictionNode &node);
+	
+	private:
+	 	//! Insert to the queues
+		void ProbationaryQueueInsert();
+		void MainQueueInsert();
+		void GhostQueueInsert();
+
+	 	//! Evict from the queues
+		void ProbationaryQueueEvict();
+		void MainQueueEvict();
+		void GhostQueueEvict();
+	
+	private:
+	 	//! TODO: Set these based on memory limit and block sizes
+		//! Probationary Queue Size
+		constexpr static idx_t PROBATIONARY_QUEUE_SIZE = 4096;
+		//! Main Queue Size
+		constexpr static idx_t MAIN_QUEUE_SIZE = 4096;
+
+		//! Locked, if we're trying to forcefully evict a node.
+		//! Only lets a single thread enter the phase.
+		mutex purge_lock;
+	};
+
 protected:
 	enum class MemoryUsageCaches {
 		FLUSH,
@@ -152,6 +208,8 @@ protected:
 	bool track_eviction_timestamps;
 	//! Eviction queues
 	vector<unique_ptr<EvictionQueue>> queues;
+	//! S3 FIFO queues
+	vector<unique_ptr<S3FifoQueue>> fifo_queues;
 	//! Memory manager for concurrently used temporary memory, e.g., for physical operators
 	unique_ptr<TemporaryMemoryManager> temporary_memory_manager;
 	//! To improve performance, MemoryUsage maintains counter caches based on current cpu or thread id,
