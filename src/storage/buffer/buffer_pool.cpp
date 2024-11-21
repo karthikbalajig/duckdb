@@ -37,7 +37,12 @@ shared_ptr<BlockHandle> BufferEvictionNode::TryGetBlockHandle() {
 	return handle_p;
 }
 
+S3FifoNode::S3FifoNode(weak_ptr<BlockHandle> handle_p, uint8_t accesses) : handle(std::move(handle_p)), accesses(accesses) {
+	D_ASSERT(!handle.expired());
+}
+
 typedef duckdb_moodycamel::ConcurrentQueue<BufferEvictionNode> eviction_queue_t;
+typedef duckdb_moodycamel::ConcurrentQueue<S3FifoNode> fifo_queue_t;
 
 struct EvictionQueue {
 public:
@@ -195,6 +200,80 @@ void EvictionQueue::PurgeIteration(const idx_t purge_size) {
 	}
 
 	total_dead_nodes -= actually_dequeued - alive_nodes;
+}
+
+//! Struct for the S3 FIFO queue
+struct S3FifoQueue {
+public:
+	S3FifoQueue();
+
+	fifo_queue_t probationary_queue;
+	fifo_queue_t main_queue;
+	fifo_queue_t ghost_queue;
+
+	//! Inserts a new node to the FIFO queue
+	void QueueInsert(BufferEvictionNode &&node);
+	//! Tries to dequeue an element, but only after acquiring the purge queue lock.
+	bool TryDequeueWithLock(BufferEvictionNode &node);
+
+private:
+	//! Insert to the queues
+	void ProbationaryQueueInsert(S3FifoNode &&node);
+	void MainQueueInsert(S3FifoNode &&node);
+	void GhostQueueInsert(S3FifoNode &&node);
+
+	//! Evict from the queues
+	bool ProbationaryQueueEvict();
+	void MainQueueEvict();
+	void GhostQueueEvict();
+
+private:
+	//! TODO: Set these based on memory limit and block sizes
+	//! Probationary Queue Size
+	constexpr static idx_t PROBATIONARY_QUEUE_SIZE = 4096;
+	//! Main Queue Size
+	constexpr static idx_t MAIN_QUEUE_SIZE = 4096;
+
+	//! Locked, if we're trying to forcefully evict a node.
+	//! Only lets a single thread enter the phase.
+	mutex purge_lock;
+};
+
+void S3FifoQueue::ProbationaryQueueInsert(S3FifoNode &&node) {
+	//! TODO: Evict node if full
+	node.accesses = 0;
+	probationary_queue.enqueue(std::move(node));
+}
+
+void S3FifoQueue::MainQueueInsert(S3FifoNode &&node) {
+	//! TODO: Evict node if full
+	node.accesses = 0;
+	main_queue.enqueue(std::move(node));
+}
+
+void S3FifoQueue::GhostQueueInsert(S3FifoNode &&node) {
+	//! TODO: Evict node if full
+	node.accesses = 0;
+	ghost_queue.enqueue(std::move(node));
+}
+
+bool S3FifoQueue::ProbationaryQueueEvict() {
+	S3FifoNode node;
+	if (!probationary_queue.try_dequeue(node)) {
+		//! TODO: Handle if try dequeue fails, try dequeue with lock?
+		return false;
+	}
+
+	// Check the node access frequency
+	if (node.accesses > 0) {
+		// Move to main queue
+		MainQueueInsert(std::move(node));
+	} else {
+		// Move to ghost queue
+		GhostQueueInsert(std::move(node));
+	}
+
+	return true;
 }
 
 BufferPool::BufferPool(idx_t maximum_memory, bool track_eviction_timestamps,

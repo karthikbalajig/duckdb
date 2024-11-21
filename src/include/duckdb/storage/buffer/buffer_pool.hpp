@@ -22,6 +22,7 @@ namespace duckdb {
 
 class TemporaryMemoryManager;
 struct EvictionQueue;
+struct S3FifoQueue;
 
 struct BufferEvictionNode {
 	BufferEvictionNode() {
@@ -38,17 +39,16 @@ struct BufferEvictionNode {
 struct S3FifoNode {
 	S3FifoNode() {
 	}
-	S3FifoNode(weak_ptr<BlockHandle> handle);
+	S3FifoNode(weak_ptr<BlockHandle> handle, uint8_t accesses);
 
+	//! TODO: Include state to know which queue the node is in
+	//! TODO: Can probably combine accesses into 1 variable
 	//! Weak pointer to the corresponding block handle
 	weak_ptr<BlockHandle> handle;
-	//! Whether or not the block was accessed while in the probationary queue
-	atomic<bool> probationary_access;
-	//! Number of accesses in main queue
-	atomic<uint8_t> main_accesses;
+	//! Number of accesses in main queue or probarionary queue
+	//! TODO: Does this need to be atomic
+	uint8_t accesses;
 };
-
-typedef duckdb_moodycamel::ConcurrentQueue<S3FifoNode> fifo_queue_t;
 
 //! The BufferPool is in charge of handling memory management for one or more databases. It defines memory limits
 //! and implements priority eviction among all users of the pool.
@@ -115,44 +115,6 @@ protected:
 	static constexpr idx_t TINY_BUFFER_QUEUE_SIZE = 1;
 	//! Mapping and priority order for the eviction queues
 	const array<idx_t, FILE_BUFFER_TYPE_COUNT> eviction_queue_sizes;
-
-
-	//! Struct for the S3 FIFO queue
-	struct S3FifoQueue {
-	public:
-		S3FifoQueue();
-
-		fifo_queue_t probationary_queue;
-		fifo_queue_t main_queue;
-		fifo_queue_t ghost_queue;
-
-		//! Inserts a new node to the FIFO queue
-		void QueueInsert(BufferEvictionNode &&node);
-		//! Tries to dequeue an element, but only after acquiring the purge queue lock.
-		bool TryDequeueWithLock(BufferEvictionNode &node);
-	
-	private:
-	 	//! Insert to the queues
-		void ProbationaryQueueInsert();
-		void MainQueueInsert();
-		void GhostQueueInsert();
-
-	 	//! Evict from the queues
-		void ProbationaryQueueEvict();
-		void MainQueueEvict();
-		void GhostQueueEvict();
-	
-	private:
-	 	//! TODO: Set these based on memory limit and block sizes
-		//! Probationary Queue Size
-		constexpr static idx_t PROBATIONARY_QUEUE_SIZE = 4096;
-		//! Main Queue Size
-		constexpr static idx_t MAIN_QUEUE_SIZE = 4096;
-
-		//! Locked, if we're trying to forcefully evict a node.
-		//! Only lets a single thread enter the phase.
-		mutex purge_lock;
-	};
 
 protected:
 	enum class MemoryUsageCaches {
