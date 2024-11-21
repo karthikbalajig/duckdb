@@ -37,7 +37,7 @@ shared_ptr<BlockHandle> BufferEvictionNode::TryGetBlockHandle() {
 	return handle_p;
 }
 
-S3FifoNode::S3FifoNode(weak_ptr<BlockHandle> handle_p, uint8_t accesses) : handle(std::move(handle_p)), accesses(accesses) {
+S3FifoNode::S3FifoNode(weak_ptr<BlockHandle> handle_p) : handle(std::move(handle_p)) {
 	D_ASSERT(!handle.expired());
 }
 
@@ -241,19 +241,40 @@ private:
 
 void S3FifoQueue::ProbationaryQueueInsert(S3FifoNode &&node) {
 	//! TODO: Evict node if full
-	node.accesses = 0;
+	auto handle_p = node.handle.lock();
+	if (!handle_p) {
+		// BlockHandle has been destroyed
+		return;
+	}
+	
+	// Reset access frequency
+	handle_p->ResetAccesses();
 	probationary_queue.enqueue(std::move(node));
 }
 
 void S3FifoQueue::MainQueueInsert(S3FifoNode &&node) {
 	//! TODO: Evict node if full
-	node.accesses = 0;
+	auto handle_p = node.handle.lock();
+	if (!handle_p) {
+		// BlockHandle has been destroyed
+		return;
+	}
+	
+	// Reset access frequency
+	handle_p->ResetAccesses();
 	main_queue.enqueue(std::move(node));
 }
 
 void S3FifoQueue::GhostQueueInsert(S3FifoNode &&node) {
 	//! TODO: Evict node if full
-	node.accesses = 0;
+	auto handle_p = node.handle.lock();
+	if (!handle_p) {
+		// BlockHandle has been destroyed
+		return;
+	}
+	
+	// Reset access frequency
+	handle_p->ResetAccesses();
 	ghost_queue.enqueue(std::move(node));
 }
 
@@ -264,8 +285,15 @@ bool S3FifoQueue::ProbationaryQueueEvict() {
 		return false;
 	}
 
+	auto handle_p = node.handle.lock();
+	if (!handle_p) {
+		// BlockHandle has been destroyed
+		return true;
+	}
+
 	// Check the node access frequency
-	if (node.accesses > 0) {
+	auto accesses = handle_p->GetAccesses();
+	if (accesses > 0) {
 		// Move to main queue
 		MainQueueInsert(std::move(node));
 	} else {

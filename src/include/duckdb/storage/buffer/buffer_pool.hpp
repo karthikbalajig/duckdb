@@ -39,15 +39,12 @@ struct BufferEvictionNode {
 struct S3FifoNode {
 	S3FifoNode() {
 	}
-	S3FifoNode(weak_ptr<BlockHandle> handle, uint8_t accesses);
+	S3FifoNode(weak_ptr<BlockHandle> handle);
 
 	//! TODO: Include state to know which queue the node is in
 	//! TODO: Can probably combine accesses into 1 variable
 	//! Weak pointer to the corresponding block handle
 	weak_ptr<BlockHandle> handle;
-	//! Number of accesses in main queue or probarionary queue
-	//! TODO: Does this need to be atomic
-	uint8_t accesses;
 };
 
 //! The BufferPool is in charge of handling memory management for one or more databases. It defines memory limits

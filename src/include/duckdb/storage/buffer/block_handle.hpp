@@ -130,6 +130,14 @@ public:
 		return eviction_queue_idx;
 	}
 
+	uint8_t GetAccesses() {
+		return accesses;
+	}
+
+	void ResetAccesses() {
+		accesses = 0;
+	}
+
 	FileBufferType GetBufferType() const {
 		return buffer_type;
 	}
@@ -208,6 +216,9 @@ private:
 	const char *unswizzled;
 	//! Index for eviction queue (FileBufferType::MANAGED_BUFFER only, for now)
 	atomic<idx_t> eviction_queue_idx;
+	//! TODO: Does this need to be atomic
+	//! The number of accesses to the block in the queues
+	atomic<uint8_t> accesses;
 };
 
 } // namespace duckdb
