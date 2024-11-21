@@ -55,6 +55,8 @@ struct TempBufferPoolReservation : BufferPoolReservation {
 	}
 };
 
+enum class S3FifoQueueType : uint8_t { GHOST_QUEUE, MAIN_QUEUE, PROBATIONARY_QUEUE, NO_QUEUE };
+
 using BlockLock = unique_lock<mutex>;
 
 class BlockHandle : public enable_shared_from_this<BlockHandle> {
@@ -134,8 +136,24 @@ public:
 		return accesses;
 	}
 
+	uint8_t IncrementAccesses() {
+		return ++accesses;
+	}
+
+	void SetAccesses(const uint8_t accesses_p) {
+		accesses = accesses_p;
+	}
+
 	void ResetAccesses() {
 		accesses = 0;
+	}
+
+	S3FifoQueueType GetQueueType() const {
+		return queue_type;
+	}
+
+	void SetQueueType(S3FifoQueueType queue_type_p) {
+		queue_type = queue_type_p;
 	}
 
 	FileBufferType GetBufferType() const {
@@ -219,6 +237,8 @@ private:
 	//! TODO: Does this need to be atomic
 	//! The number of accesses to the block in the queues
 	atomic<uint8_t> accesses;
+	// S3 FIFO Queue state
+	S3FifoQueueType queue_type = S3FifoQueueType::NO_QUEUE;
 };
 
 } // namespace duckdb

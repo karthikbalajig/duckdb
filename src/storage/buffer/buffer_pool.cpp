@@ -212,14 +212,14 @@ public:
 	fifo_queue_t ghost_queue;
 
 	//! Inserts a new node to the FIFO queue
-	void QueueInsert(BufferEvictionNode &&node);
+	void QueueInsert(shared_ptr<BlockHandle> handle);
 	//! Tries to dequeue an element, but only after acquiring the purge queue lock.
 	bool TryDequeueWithLock(BufferEvictionNode &node);
 
 private:
 	//! Insert to the queues
 	void ProbationaryQueueInsert(S3FifoNode &&node);
-	void MainQueueInsert(S3FifoNode &&node);
+	void MainQueueInsert(S3FifoNode &&node, uint8_t default_accesses=0);
 	void GhostQueueInsert(S3FifoNode &&node);
 
 	//! Evict from the queues
@@ -239,6 +239,23 @@ private:
 	mutex purge_lock;
 };
 
+void S3FifoQueue::QueueInsert(shared_ptr<BlockHandle> handle) {
+	switch (handle->GetQueueType()) {
+	case S3FifoQueueType::NO_QUEUE:
+		ProbationaryQueueInsert(S3FifoNode(weak_ptr<BlockHandle>(handle)));
+		break;
+
+	case S3FifoQueueType::PROBATIONARY_QUEUE:
+	case S3FifoQueueType::MAIN_QUEUE:
+		handle->IncrementAccesses();
+		break;
+	
+	case S3FifoQueueType::GHOST_QUEUE:
+		//! Move to main queue
+		MainQueueInsert(S3FifoNode(weak_ptr<BlockHandle>(handle)));
+	}
+}
+
 void S3FifoQueue::ProbationaryQueueInsert(S3FifoNode &&node) {
 	//! TODO: Evict node if full
 	auto handle_p = node.handle.lock();
@@ -252,27 +269,37 @@ void S3FifoQueue::ProbationaryQueueInsert(S3FifoNode &&node) {
 	probationary_queue.enqueue(std::move(node));
 }
 
-void S3FifoQueue::MainQueueInsert(S3FifoNode &&node) {
+void S3FifoQueue::MainQueueInsert(S3FifoNode &&node, uint8_t default_accesses) {
 	//! TODO: Evict node if full
+	//! Get a reference to the underlying block pointer
 	auto handle_p = node.handle.lock();
 	if (!handle_p) {
 		// BlockHandle has been destroyed
 		return;
 	}
 	
+	handle_p->SetQueueType(S3FifoQueueType::MAIN_QUEUE);
+
 	// Reset access frequency
-	handle_p->ResetAccesses();
+	if (default_accesses > 0) {
+		handle_p->SetAccesses(default_accesses);
+	} else {
+		handle_p->ResetAccesses();
+	}
 	main_queue.enqueue(std::move(node));
 }
 
 void S3FifoQueue::GhostQueueInsert(S3FifoNode &&node) {
 	//! TODO: Evict node if full
+	//! Get a reference to the underlying block pointer
 	auto handle_p = node.handle.lock();
 	if (!handle_p) {
 		// BlockHandle has been destroyed
 		return;
 	}
 	
+	handle_p->SetQueueType(S3FifoQueueType::GHOST_QUEUE);
+
 	// Reset access frequency
 	handle_p->ResetAccesses();
 	ghost_queue.enqueue(std::move(node));
@@ -285,11 +312,14 @@ bool S3FifoQueue::ProbationaryQueueEvict() {
 		return false;
 	}
 
+	//! Get a reference to the underlying block pointer
 	auto handle_p = node.handle.lock();
 	if (!handle_p) {
 		// BlockHandle has been destroyed
 		return true;
 	}
+
+	handle_p->SetQueueType(S3FifoQueueType::PROBATIONARY_QUEUE);
 
 	// Check the node access frequency
 	auto accesses = handle_p->GetAccesses();
@@ -302,6 +332,75 @@ bool S3FifoQueue::ProbationaryQueueEvict() {
 	}
 
 	return true;
+}
+
+void S3FifoQueue::MainQueueEvict() {
+	//! TODO: What to do if loop loop loop
+	while (true) {
+		S3FifoNode node;
+		if (!main_queue.try_dequeue(node)) {
+			//! TODO: Handle if try dequeue fails, try dequeue with lock?
+			return;
+		}
+
+		//! Get a reference to the underlying block pointer
+		auto handle_p = node.handle.lock();
+		if (!handle_p) {
+			// BlockHandle has been destroyed
+			return;
+		}
+
+		//! TODO: Modify CanUnload
+		//! Grab the mutex and check if we can free the block
+		auto lock = handle_p->GetLock();
+		if (!handle_p->CanUnload()) {
+			//! Lazy promotion
+			MainQueueInsert(std::move(node), 1);
+			continue;
+		}
+
+		//! Check the node access frequency
+		auto accesses = handle_p->GetAccesses();
+		if (accesses > 0) {
+			//! Lazy promotion
+			MainQueueInsert(std::move(node));
+			continue;
+		}
+
+		//! TODO: Modify Unload if necessary
+		//! Release the memory and mark the block as unloaded
+		handle_p->Unload(lock);
+		break;
+	}
+
+}
+
+void S3FifoQueue::GhostQueueEvict() {
+	S3FifoNode node;
+	if (!ghost_queue.try_dequeue(node)) {
+		//! TODO: Handle if try dequeue fails, try dequeue with lock?
+		return;
+	}
+
+	//! Get a reference to the underlying block pointer
+	auto handle_p = node.handle.lock();
+	if (!handle_p) {
+		// BlockHandle has been destroyed
+		return;
+	}
+
+	if (handle_p->GetQueueType() == S3FifoQueueType::MAIN_QUEUE) {
+		return;
+	}
+
+	//! TODO: Modify CanUnload
+	//! Grab the mutex and check if we can free the block
+	auto lock = handle_p->GetLock();
+	D_ASSERT(!handle_p->CanUnload());
+
+	//! TODO: Modify Unload if necessary
+	//! Release the memory and mark the block as unloaded
+	handle_p->Unload(lock);
 }
 
 BufferPool::BufferPool(idx_t maximum_memory, bool track_eviction_timestamps,
