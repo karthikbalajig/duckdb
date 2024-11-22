@@ -104,10 +104,6 @@ public:
 		destroy_buffer_upon = destroy_buffer_upon_p;
 	}
 
-	inline bool MustAddToEvictionQueue() const {
-		return destroy_buffer_upon != DestroyBufferUpon::UNPIN;
-	}
-
 	inline bool MustWriteToTemporaryFile() const {
 		return destroy_buffer_upon == DestroyBufferUpon::BLOCK;
 	}

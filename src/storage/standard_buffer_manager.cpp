@@ -317,6 +317,7 @@ BufferHandle StandardBufferManager::Pin(shared_ptr<BlockHandle> &handle) {
 		if (handle->GetState() == BlockState::BLOCK_LOADED) {
 			// the block is loaded, increment the reader count and set the BufferHandle
 			buf = handle->Load();
+			buffer_pool.AddToQueue(handle);
 		}
 		required_memory = handle->GetMemoryUsage();
 	}
@@ -337,6 +338,7 @@ BufferHandle StandardBufferManager::Pin(shared_ptr<BlockHandle> &handle) {
 			// the block is loaded, increment the reader count and return a pointer to the handle
 			reservation.Resize(0);
 			buf = handle->Load();
+			buffer_pool.AddToQueue(handle);
 		} else {
 			// now we can actually load the current block
 			D_ASSERT(handle->Readers() == 0);
@@ -350,6 +352,7 @@ BufferHandle StandardBufferManager::Pin(shared_ptr<BlockHandle> &handle) {
 				handle->ChangeMemoryUsage(lock, delta);
 			}
 			D_ASSERT(handle->GetMemoryUsage() == handle->GetBuffer(lock)->AllocSize());
+			buffer_pool.AddToQueue(handle);
 		}
 	}
 
@@ -357,14 +360,6 @@ BufferHandle StandardBufferManager::Pin(shared_ptr<BlockHandle> &handle) {
 	// return it without holding the BlockHandle's lock
 	D_ASSERT(buf.IsValid());
 	return buf;
-}
-
-void StandardBufferManager::PurgeQueue(const BlockHandle &handle) {
-	buffer_pool.PurgeQueue(handle);
-}
-
-void StandardBufferManager::AddToEvictionQueue(shared_ptr<BlockHandle> &handle) {
-	buffer_pool.AddToEvictionQueue(handle);
 }
 
 void StandardBufferManager::VerifyZeroReaders(BlockLock &lock, shared_ptr<BlockHandle> &handle) {
@@ -386,27 +381,13 @@ void StandardBufferManager::VerifyZeroReaders(BlockLock &lock, shared_ptr<BlockH
 }
 
 void StandardBufferManager::Unpin(shared_ptr<BlockHandle> &handle) {
-	bool purge = false;
 	{
 		auto lock = handle->GetLock();
 		if (!handle->GetBuffer(lock) || handle->GetBufferType() == FileBufferType::TINY_BUFFER) {
 			return;
 		}
 		D_ASSERT(handle->Readers() > 0);
-		auto new_readers = handle->DecrementReaders();
-		if (new_readers == 0) {
-			VerifyZeroReaders(lock, handle);
-			if (handle->MustAddToEvictionQueue()) {
-				purge = buffer_pool.AddToEvictionQueue(handle);
-			} else {
-				handle->Unload(lock);
-			}
-		}
-	}
-
-	// We do not have to keep the handle locked while purging.
-	if (purge) {
-		PurgeQueue(*handle);
+		handle->DecrementReaders();
 	}
 }
 

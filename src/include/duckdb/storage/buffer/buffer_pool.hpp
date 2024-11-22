@@ -90,28 +90,13 @@ protected:
 	};
 	virtual EvictionResult EvictBlocks(MemoryTag tag, idx_t extra_memory, idx_t memory_limit,
 	                                   unique_ptr<FileBuffer> *buffer = nullptr);
-	virtual EvictionResult EvictBlocksInternal(EvictionQueue &queue, MemoryTag tag, idx_t extra_memory,
+	virtual EvictionResult EvictBlocksInternal(S3FifoQueue &queue, MemoryTag tag, idx_t extra_memory,
 	                                           idx_t memory_limit, unique_ptr<FileBuffer> *buffer = nullptr);
 
-	//! Purge all blocks that haven't been pinned within the last N seconds
-	idx_t PurgeAgedBlocks(uint32_t max_age_sec);
-	idx_t PurgeAgedBlocksInternal(EvictionQueue &queue, uint32_t max_age_sec, int64_t now, int64_t limit);
-	//! Garbage collect dead nodes in the eviction queue.
-	void PurgeQueue(const BlockHandle &handle);
-	//! Add a buffer handle to the eviction queue. Returns true, if the queue is
-	//! ready to be purged, and false otherwise.
-	bool AddToEvictionQueue(shared_ptr<BlockHandle> &handle);
-	//! Gets the eviction queue for the specified type
-	EvictionQueue &GetEvictionQueueForBlockHandle(const BlockHandle &handle);
-	//! Increments the dead nodes for the queue with specified type
-	void IncrementDeadNodes(const BlockHandle &handle);
-
-	//! How many eviction queues we have for the different FileBufferTypes
-	static constexpr idx_t BLOCK_QUEUE_SIZE = 1;
-	static constexpr idx_t MANAGED_BUFFER_QUEUE_SIZE = 6;
-	static constexpr idx_t TINY_BUFFER_QUEUE_SIZE = 1;
-	//! Mapping and priority order for the eviction queues
-	const array<idx_t, FILE_BUFFER_TYPE_COUNT> eviction_queue_sizes;
+	//! Add a buffer handle to the S3 FIFO queue, based on its buffer type
+	void AddToQueue(shared_ptr<BlockHandle> &handle);
+	//! Gets the S3 FIFO queue for the specified type
+	S3FifoQueue &GetS3FifoQueueForBlockHandle(const BlockHandle &handle);
 
 protected:
 	enum class MemoryUsageCaches {
@@ -165,8 +150,6 @@ protected:
 	atomic<idx_t> allocator_bulk_deallocation_flush_threshold;
 	//! Record timestamps of buffer manager unpin() events. Usable by custom eviction policies.
 	bool track_eviction_timestamps;
-	//! Eviction queues
-	vector<unique_ptr<EvictionQueue>> queues;
 	//! S3 FIFO queues
 	vector<unique_ptr<S3FifoQueue>> fifo_queues;
 	//! Memory manager for concurrently used temporary memory, e.g., for physical operators
