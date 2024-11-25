@@ -55,12 +55,15 @@ private:
 	constexpr static idx_t PROBATIONARY_QUEUE_SIZE = 4096;
 	//! Main Queue Size
 	constexpr static idx_t MAIN_QUEUE_SIZE = 4096;
+	//! Ghost Queue Size
+	constexpr static idx_t GHOST_QUEUE_SIZE = 4096;
 
 	//! Locked, if we're trying to forcefully evict a node.
 	//! Only lets a single thread enter the phase.
 	mutex purge_lock;
 };
 
+//! TODO: Use locking in places 
 void S3FifoQueue::QueueInsert(shared_ptr<BlockHandle> handle) {
 	switch (handle->GetQueueType()) {
 	case S3FifoQueueType::NO_QUEUE:
@@ -91,6 +94,10 @@ bool S3FifoQueue::Evict() {
 
 void S3FifoQueue::ProbationaryQueueInsert(S3FifoNode &&node) {
 	//! TODO: Evict node if full
+	while (probationary_queue.size_approx() >= PROBATIONARY_QUEUE_SIZE) {
+		ProbationaryQueueEvict();
+	}
+
 	auto handle_p = node.handle.lock();
 	if (!handle_p) {
 		// BlockHandle has been destroyed
@@ -104,6 +111,10 @@ void S3FifoQueue::ProbationaryQueueInsert(S3FifoNode &&node) {
 
 void S3FifoQueue::MainQueueInsert(S3FifoNode &&node, uint8_t default_accesses) {
 	//! TODO: Evict node if full
+	while (main_queue.size_approx() >= MAIN_QUEUE_SIZE) {
+		MainQueueEvict();
+	}
+
 	//! Get a reference to the underlying block pointer
 	auto handle_p = node.handle.lock();
 	if (!handle_p) {
@@ -124,6 +135,10 @@ void S3FifoQueue::MainQueueInsert(S3FifoNode &&node, uint8_t default_accesses) {
 
 void S3FifoQueue::GhostQueueInsert(S3FifoNode &&node) {
 	//! TODO: Evict node if full
+	while (ghost_queue.size_approx() >= GHOST_QUEUE_SIZE) {
+		GhostQueueEvict();
+	}
+
 	//! Get a reference to the underlying block pointer
 	auto handle_p = node.handle.lock();
 	if (!handle_p) {
@@ -169,7 +184,8 @@ bool S3FifoQueue::ProbationaryQueueEvict() {
 
 bool S3FifoQueue::MainQueueEvict() {
 	//! TODO: What to do if loop loop loop
-	while (true) {
+	int LOOPS = 10;
+	for (int i = 0; i < LOOPS; i++) {
 		S3FifoNode node;
 		if (!main_queue.try_dequeue(node)) {
 			//! TODO: Handle if try dequeue fails, try dequeue with lock?
@@ -186,6 +202,11 @@ bool S3FifoQueue::MainQueueEvict() {
 		//! TODO: Modify CanUnload
 		//! Grab the mutex and check if we can free the block
 		auto lock = handle_p->GetLock();
+		
+		if (handle_p->IsUnloaded()) {
+			return true;
+		}
+
 		if (!handle_p->CanUnload()) {
 			//! Lazy promotion
 			MainQueueInsert(std::move(node), 1);
@@ -230,7 +251,19 @@ bool S3FifoQueue::GhostQueueEvict() {
 	//! TODO: Modify CanUnload
 	//! Grab the mutex and check if we can free the block
 	auto lock = handle_p->GetLock();
-	D_ASSERT(handle_p->CanUnload());
+	if (handle_p->IsUnloaded()) {
+		return true;
+	}
+
+	// D_ASSERT(handle_p->CanUnload());
+	if (!handle_p->CanUnload()) {
+		if (handle_p->GetQueueType() == S3FifoQueueType::GHOST_QUEUE) {
+			handle_p->SetQueueType(S3FifoQueueType::NO_QUEUE);
+		}
+		//! Keep in buffer pool
+		QueueInsert(handle_p);
+		return true;
+	}
 
 	//! TODO: Modify Unload if necessary
 	//! Release the memory and mark the block as unloaded
@@ -307,6 +340,7 @@ BufferPool::EvictionResult BufferPool::EvictBlocks(MemoryTag tag, idx_t extra_me
 }
 
 //! TODO: Do we need extra_memory == freed block exactly optimization
+//! TODO: Should the logic be amended for individual file buffer types?
 BufferPool::EvictionResult BufferPool::EvictBlocksInternal(S3FifoQueue &queue, MemoryTag tag, idx_t extra_memory,
                                                            idx_t memory_limit, unique_ptr<FileBuffer> *buffer) {
 	TempBufferPoolReservation r(tag, *this, extra_memory);
