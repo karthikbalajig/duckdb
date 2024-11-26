@@ -52,11 +52,11 @@ private:
 private:
 	//! TODO: Set these based on memory limit and block sizes
 	//! Probationary Queue Size
-	constexpr static idx_t PROBATIONARY_QUEUE_SIZE = 4096;
+	constexpr static idx_t PROBATIONARY_QUEUE_SIZE = 512;
 	//! Main Queue Size
-	constexpr static idx_t MAIN_QUEUE_SIZE = 4096;
+	constexpr static idx_t MAIN_QUEUE_SIZE = 8192;
 	//! Ghost Queue Size
-	constexpr static idx_t GHOST_QUEUE_SIZE = 4096;
+	constexpr static idx_t GHOST_QUEUE_SIZE = 8192;
 
 	//! Locked, if we're trying to forcefully evict a node.
 	//! Only lets a single thread enter the phase.
