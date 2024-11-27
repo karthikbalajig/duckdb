@@ -19,8 +19,12 @@ typedef duckdb_moodycamel::ConcurrentQueue<S3FifoNode> fifo_queue_t;
 //! Struct for the S3 FIFO queue
 struct S3FifoQueue {
 public:
-	explicit S3FifoQueue(const FileBufferType file_buffer_type_p)
+	explicit S3FifoQueue(const FileBufferType file_buffer_type_p, idx_t maximum_memory)
 	    : file_buffer_type(file_buffer_type_p) {
+			idx_t gigabytes = ((maximum_memory / 1024) / 1024) / 1024;
+			PROBATIONARY_QUEUE_SIZE = 1024;
+			MAIN_QUEUE_SIZE = (4096 * gigabytes * 2) / 3;
+			GHOST_QUEUE_SIZE = (4096 * gigabytes) / 3;
 	}
 
 	//! 3 static queues for S3 FIFO
@@ -51,12 +55,11 @@ private:
 
 private:
 	//! TODO: Set these based on memory limit and block sizes
-	//! Probationary Queue Size
-	constexpr static idx_t PROBATIONARY_QUEUE_SIZE = 512;
-	//! Main Queue Size
-	constexpr static idx_t MAIN_QUEUE_SIZE = 8192;
-	//! Ghost Queue Size
-	constexpr static idx_t GHOST_QUEUE_SIZE = 8192;
+	//! TODO: Make static constexpr?
+	//! S3 Queue Sizes
+	idx_t PROBATIONARY_QUEUE_SIZE;
+	idx_t MAIN_QUEUE_SIZE;
+	idx_t GHOST_QUEUE_SIZE;
 
 	//! Locked, if we're trying to forcefully evict a node.
 	//! Only lets a single thread enter the phase.
@@ -184,8 +187,7 @@ bool S3FifoQueue::ProbationaryQueueEvict() {
 
 bool S3FifoQueue::MainQueueEvict() {
 	//! TODO: What to do if loop loop loop
-	int LOOPS = 10;
-	for (int i = 0; i < LOOPS; i++) {
+	for (int i = 0; i < MAIN_QUEUE_SIZE; i++) {
 		S3FifoNode node;
 		if (!main_queue.try_dequeue(node)) {
 			//! TODO: Handle if try dequeue fails, try dequeue with lock?
@@ -280,7 +282,7 @@ BufferPool::BufferPool(idx_t maximum_memory, bool track_eviction_timestamps,
       temporary_memory_manager(make_uniq<TemporaryMemoryManager>()) {
 	for (uint8_t type_idx = 0; type_idx < FILE_BUFFER_TYPE_COUNT; type_idx++) {
 		const auto type = static_cast<FileBufferType>(type_idx + 1);
-		fifo_queues.push_back(make_uniq<S3FifoQueue>(type));
+		fifo_queues.push_back(make_uniq<S3FifoQueue>(type, maximum_memory));
 	}
 }
 BufferPool::~BufferPool() {
@@ -378,6 +380,7 @@ BufferPool::EvictionResult BufferPool::EvictBlocksInternal(S3FifoQueue &queue, M
 void BufferPool::SetLimit(idx_t limit, const char *exception_postscript) {
 	lock_guard<mutex> l_lock(limit_lock);
 	// try to evict until the limit is reached
+	//! TODO: Resize queues based on memory limit
 	if (!EvictBlocks(MemoryTag::EXTENSION, 0, limit).success) {
 		throw OutOfMemoryException(
 		    "Failed to change memory limit to %lld: could not free up enough memory for the new limit%s", limit,
