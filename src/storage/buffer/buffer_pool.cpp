@@ -27,6 +27,8 @@ public:
 			GHOST_QUEUE_SIZE = (4096 * gigabytes) / 3;
 	}
 
+	virtual ~S3FifoQueue();
+
 	//! 3 static queues for S3 FIFO
 	fifo_queue_t probationary_queue;
 	fifo_queue_t main_queue;
@@ -65,6 +67,31 @@ private:
 	//! Only lets a single thread enter the phase.
 	mutex purge_lock;
 };
+
+S3FifoQueue::~S3FifoQueue() {
+    S3FifoNode node;
+    while (probationary_queue.try_dequeue(node)) {
+        // Ensure all resources are released
+        auto handle_p = node.handle.lock();
+        if (handle_p) {
+            handle_p->SetQueueType(S3FifoQueueType::NO_QUEUE);
+        }
+    }
+
+    while (main_queue.try_dequeue(node)) {
+        auto handle_p = node.handle.lock();
+        if (handle_p) {
+            handle_p->SetQueueType(S3FifoQueueType::NO_QUEUE);
+        }
+    }
+
+    while (ghost_queue.try_dequeue(node)) {
+        auto handle_p = node.handle.lock();
+        if (handle_p) {
+            handle_p->SetQueueType(S3FifoQueueType::NO_QUEUE);
+        }
+    }
+}
 
 //! TODO: Use locking in places 
 void S3FifoQueue::QueueInsert(shared_ptr<BlockHandle> handle) {
