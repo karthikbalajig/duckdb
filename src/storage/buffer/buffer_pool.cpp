@@ -21,10 +21,12 @@ struct S3FifoQueue {
 public:
 	explicit S3FifoQueue(const FileBufferType file_buffer_type_p, idx_t maximum_memory)
 	    : file_buffer_type(file_buffer_type_p) {
-			idx_t gigabytes = ((maximum_memory / 1024) / 1024) / 1024;
-			PROBATIONARY_QUEUE_SIZE = 1024;
-			MAIN_QUEUE_SIZE = (4096 * gigabytes * 2) / 3;
-			GHOST_QUEUE_SIZE = (4096 * gigabytes) / 3;
+			// idx_t gigabytes = ((maximum_memory / 1024) / 1024) / 1024;
+			idx_t block_size = 1024 * 256;
+			idx_t blocks = maximum_memory / block_size;
+			PROBATIONARY_QUEUE_SIZE = blocks / 25;
+			MAIN_QUEUE_SIZE = (blocks * 12) / 25;
+			GHOST_QUEUE_SIZE = (blocks * 12) / 25;
 	}
 
 	virtual ~S3FifoQueue();
@@ -40,7 +42,7 @@ public:
 	//! Inserts a new node to the FIFO queue
 	void QueueInsert(shared_ptr<BlockHandle> handle);
 	//! Tries to dequeue an element, but only after acquiring the purge queue lock.
-	bool TryDequeueWithLock(S3FifoNode &node);
+	bool TryDequeueWithLock(S3FifoNode &node, S3FifoQueueType queue_type);
 	//! Evicts a node from the FIFO queue
 	bool Evict();
 
@@ -48,6 +50,7 @@ private:
 	//! Insert to the queues
 	void ProbationaryQueueInsert(S3FifoNode &&node);
 	void MainQueueInsert(S3FifoNode &&node, uint8_t default_accesses=0);
+	// void MainQueueInsert(S3FifoNode &&node, bool default_accesses=false);
 	void GhostQueueInsert(S3FifoNode &&node);
 
 	//! Evict from the queues
@@ -92,6 +95,20 @@ S3FifoQueue::~S3FifoQueue() {
         }
     }
 }
+ 
+bool S3FifoQueue::TryDequeueWithLock(S3FifoNode &node, S3FifoQueueType queue_type) {
+	lock_guard<mutex> l_lock(purge_lock);
+	switch (queue_type) {
+	case S3FifoQueueType::PROBATIONARY_QUEUE:
+		return probationary_queue.try_dequeue(node);
+	case S3FifoQueueType::MAIN_QUEUE:
+		return main_queue.try_dequeue(node);
+	case S3FifoQueueType::GHOST_QUEUE:
+		return ghost_queue.try_dequeue(node);
+	}
+
+	return false;
+}
 
 //! TODO: Use locking in places 
 void S3FifoQueue::QueueInsert(shared_ptr<BlockHandle> handle) {
@@ -109,6 +126,7 @@ void S3FifoQueue::QueueInsert(shared_ptr<BlockHandle> handle) {
 	case S3FifoQueueType::GHOST_QUEUE:
 		//! Move to main queue
 		MainQueueInsert(S3FifoNode(weak_ptr<BlockHandle>(handle)));
+		break;
 	}
 }
 
@@ -160,6 +178,7 @@ void S3FifoQueue::MainQueueInsert(S3FifoNode &&node, uint8_t default_accesses) {
 	} else {
 		handle_p->ResetAccesses();
 	}
+	// handle_p->SetAccesses(default_accesses);
 	main_queue.enqueue(std::move(node));
 }
 
@@ -186,7 +205,9 @@ void S3FifoQueue::GhostQueueInsert(S3FifoNode &&node) {
 bool S3FifoQueue::ProbationaryQueueEvict() {
 	S3FifoNode node;
 	if (!probationary_queue.try_dequeue(node)) {
-		//! TODO: Handle if try dequeue fails, try dequeue with lock?
+		// if (!TryDequeueWithLock(node, S3FifoQueueType::PROBATIONARY_QUEUE)) {
+		// 	return false;
+		// }
 		return false;
 	}
 
@@ -213,11 +234,12 @@ bool S3FifoQueue::ProbationaryQueueEvict() {
 }
 
 bool S3FifoQueue::MainQueueEvict() {
-	//! TODO: What to do if loop loop loop
-	for (int i = 0; i < MAIN_QUEUE_SIZE; i++) {
+	while (true) {
 		S3FifoNode node;
 		if (!main_queue.try_dequeue(node)) {
-			//! TODO: Handle if try dequeue fails, try dequeue with lock?
+			// if (!TryDequeueWithLock(node, S3FifoQueueType::MAIN_QUEUE)) {
+			// 	return false;
+			// }
 			return false;
 		}
 
@@ -236,17 +258,28 @@ bool S3FifoQueue::MainQueueEvict() {
 			return true;
 		}
 
+		auto accesses = handle_p->GetAccesses();
 		if (!handle_p->CanUnload()) {
+			if (accesses == 0) {
+				accesses = 1;
+			}
 			//! Lazy promotion
-			MainQueueInsert(std::move(node), 1);
+			MainQueueInsert(std::move(node), accesses - 1);
 			continue;
 		}
 
-		//! Check the node access frequency
-		auto accesses = handle_p->GetAccesses();
+		if (main_queue.size_approx() > 9 * MAIN_QUEUE_SIZE / 10 && handle_p->MustWriteToTemporaryFile()) {
+			// this block refers to temporary in-memory data
+			// this block cannot be destroyed upon evict/unpin
+			// in order to unload this block we need to write it to a temporary buffer
+			handle_p->Unload(lock);
+			return true;
+		}
+
+		// ! Check the node access frequency
 		if (accesses > 0) {
 			//! Lazy promotion
-			MainQueueInsert(std::move(node));
+			MainQueueInsert(std::move(node), accesses - 1);
 			continue;
 		}
 
@@ -262,7 +295,9 @@ bool S3FifoQueue::MainQueueEvict() {
 bool S3FifoQueue::GhostQueueEvict() {
 	S3FifoNode node;
 	if (!ghost_queue.try_dequeue(node)) {
-		//! TODO: Handle if try dequeue fails, try dequeue with lock?
+		// if (!TryDequeueWithLock(node, S3FifoQueueType::GHOST_QUEUE)) {
+		// 	return false;
+		// }
 		return false;
 	}
 
@@ -273,9 +308,9 @@ bool S3FifoQueue::GhostQueueEvict() {
 		return true;
 	}
 
-	if (handle_p->GetQueueType() == S3FifoQueueType::MAIN_QUEUE) {
-		return true;
-	}
+	// if (handle_p->GetQueueType() == S3FifoQueueType::MAIN_QUEUE) {
+	// 	return true;
+	// }
 
 	//! TODO: Modify CanUnload
 	//! Grab the mutex and check if we can free the block
@@ -286,11 +321,11 @@ bool S3FifoQueue::GhostQueueEvict() {
 
 	// D_ASSERT(handle_p->CanUnload());
 	if (!handle_p->CanUnload()) {
-		if (handle_p->GetQueueType() == S3FifoQueueType::GHOST_QUEUE) {
-			handle_p->SetQueueType(S3FifoQueueType::NO_QUEUE);
-		}
-		//! Keep in buffer pool
-		QueueInsert(handle_p);
+		// if (handle_p->GetQueueType() == S3FifoQueueType::GHOST_QUEUE) {
+		// 	handle_p->SetQueueType(S3FifoQueueType::NO_QUEUE);
+		// }
+		// //! Keep in buffer pool
+		// QueueInsert(handle_p);
 		return true;
 	}
 

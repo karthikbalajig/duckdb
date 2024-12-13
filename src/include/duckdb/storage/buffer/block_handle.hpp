@@ -134,8 +134,8 @@ public:
 
 	uint8_t IncrementAccesses() {
 		uint8_t current_accesses = accesses.load();
-		while (current_accesses < 255) {
-			uint8_t new_accesses = std::min(current_accesses + 1, 255);
+		while (current_accesses < 3) {
+			uint8_t new_accesses = std::min(current_accesses + 1, 3);
 			if (accesses.compare_exchange_weak(current_accesses, new_accesses)) {
 				return accesses;
 			}

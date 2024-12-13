@@ -317,7 +317,6 @@ BufferHandle StandardBufferManager::Pin(shared_ptr<BlockHandle> &handle) {
 		if (handle->GetState() == BlockState::BLOCK_LOADED) {
 			// the block is loaded, increment the reader count and set the BufferHandle
 			buf = handle->Load();
-			buffer_pool.AddToQueue(handle);
 		}
 		required_memory = handle->GetMemoryUsage();
 	}
@@ -383,7 +382,10 @@ void StandardBufferManager::VerifyZeroReaders(BlockLock &lock, shared_ptr<BlockH
 void StandardBufferManager::Unpin(shared_ptr<BlockHandle> &handle) {
 	{
 		auto lock = handle->GetLock();
-		if (!handle->GetBuffer(lock) || handle->GetBufferType() == FileBufferType::TINY_BUFFER) {
+		// if (!handle->GetBuffer(lock) || handle->GetBufferType() == FileBufferType::TINY_BUFFER) {
+		// 	return;
+		// }
+		if (!handle->GetBuffer(lock)) {
 			return;
 		}
 		D_ASSERT(handle->Readers() > 0);
