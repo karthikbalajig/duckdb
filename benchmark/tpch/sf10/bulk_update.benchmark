@@ -1,0 +1,15 @@
+# name: benchmark/tpch/sf10/bulk_update.benchmark
+# description: Benchmark for Bulk update queries
+# group: [sf10]
+
+name Bulk_Update
+group tpch
+subgroup sf10
+
+require tpch
+
+cache tpch_sf10.duckdb
+
+load benchmark/tpch/sf10/load.sql
+
+run benchmark/tpch/sf10/bulk_update.sql

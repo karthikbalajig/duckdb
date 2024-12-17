@@ -10,261 +10,363 @@
 
 namespace duckdb {
 
-BufferEvictionNode::BufferEvictionNode(weak_ptr<BlockHandle> handle_p, idx_t eviction_seq_num)
-    : handle(std::move(handle_p)), handle_sequence_number(eviction_seq_num) {
+S3FifoNode::S3FifoNode(weak_ptr<BlockHandle> handle_p) : handle(std::move(handle_p)) {
 	D_ASSERT(!handle.expired());
 }
 
-bool BufferEvictionNode::CanUnload(BlockHandle &handle_p) {
-	if (handle_sequence_number != handle_p.EvictionSequenceNumber()) {
-		// handle was used in between
-		return false;
-	}
-	return handle_p.CanUnload();
-}
+typedef duckdb_moodycamel::ConcurrentQueue<S3FifoNode> fifo_queue_t;
 
-shared_ptr<BlockHandle> BufferEvictionNode::TryGetBlockHandle() {
-	auto handle_p = handle.lock();
-	if (!handle_p) {
-		// BlockHandle has been destroyed
-		return nullptr;
-	}
-	if (!CanUnload(*handle_p)) {
-		// handle was used in between
-		return nullptr;
-	}
-	// this is the latest node in the queue with this handle
-	return handle_p;
-}
-
-typedef duckdb_moodycamel::ConcurrentQueue<BufferEvictionNode> eviction_queue_t;
-
-struct EvictionQueue {
+//! Struct for the S3 FIFO queue
+struct S3FifoQueue {
 public:
-	explicit EvictionQueue(const FileBufferType file_buffer_type_p)
-	    : file_buffer_type(file_buffer_type_p), evict_queue_insertions(0), total_dead_nodes(0) {
+	explicit S3FifoQueue(const FileBufferType file_buffer_type_p, idx_t maximum_memory)
+	    : file_buffer_type(file_buffer_type_p) {
+			// idx_t gigabytes = ((maximum_memory / 1024) / 1024) / 1024;
+			idx_t block_size = 1024 * 256;
+			idx_t blocks = maximum_memory / block_size;
+			PROBATIONARY_QUEUE_SIZE = blocks / 25;
+			MAIN_QUEUE_SIZE = (blocks * 12) / 25;
+			GHOST_QUEUE_SIZE = (blocks * 12) / 25;
 	}
 
-public:
-	//! Add a buffer handle to the eviction queue. Returns true, if the queue is
-	//! ready to be purged, and false otherwise.
-	bool AddToEvictionQueue(BufferEvictionNode &&node);
-	//! Tries to dequeue an element from the eviction queue, but only after acquiring the purge queue lock.
-	bool TryDequeueWithLock(BufferEvictionNode &node);
-	//! Garbage collect dead nodes in the eviction queue.
-	void Purge();
-	template <typename FN>
-	void IterateUnloadableBlocks(FN fn);
+	virtual ~S3FifoQueue();
 
-	//! Increment the dead node counter in the purge queue.
-	inline void IncrementDeadNodes() {
-		total_dead_nodes++;
-	}
-	//! Decrement the dead node counter in the purge queue.
-	inline void DecrementDeadNodes() {
-		total_dead_nodes--;
-	}
-
-private:
-	//! Bulk purge dead nodes from the eviction queue. Then, enqueue those that are still alive.
-	void PurgeIteration(const idx_t purge_size);
-
-public:
+	//! 3 static queues for S3 FIFO
+	fifo_queue_t probationary_queue;
+	fifo_queue_t main_queue;
+	fifo_queue_t ghost_queue;
+	
 	//! The type of the buffers in this queue
 	const FileBufferType file_buffer_type;
-	//! The concurrent queue
-	eviction_queue_t q;
+
+	//! Inserts a new node to the FIFO queue
+	void QueueInsert(shared_ptr<BlockHandle> handle);
+	//! Tries to dequeue an element, but only after acquiring the purge queue lock.
+	bool TryDequeueWithLock(S3FifoNode &node, S3FifoQueueType queue_type);
+	//! Evicts a node from the FIFO queue
+	bool Evict();
 
 private:
-	//! We trigger a purge of the eviction queue every INSERT_INTERVAL insertions
-	constexpr static idx_t INSERT_INTERVAL = 4096;
-	//! We multiply the base purge size by this value.
-	constexpr static idx_t PURGE_SIZE_MULTIPLIER = 2;
-	//! We multiply the purge size by this value to determine early-outs. This is the minimum queue size.
-	//! We never purge below this point.
-	constexpr static idx_t EARLY_OUT_MULTIPLIER = 4;
-	//! We multiply the approximate alive nodes by this value to test whether our total dead nodes
-	//! exceed their allowed ratio. Must be greater than 1.
-	constexpr static idx_t ALIVE_NODE_MULTIPLIER = 4;
+	//! Insert to the queues
+	void ProbationaryQueueInsert(S3FifoNode &&node);
+	void MainQueueInsert(S3FifoNode &&node, uint8_t default_accesses=0);
+	// void MainQueueInsert(S3FifoNode &&node, bool default_accesses=false);
+	void GhostQueueInsert(S3FifoNode &&node);
+
+	//! Evict from the queues
+	bool ProbationaryQueueEvict();
+	bool MainQueueEvict();
+	bool GhostQueueEvict();
 
 private:
-	//! Total number of insertions into the eviction queue. This guides the schedule for calling PurgeQueue.
-	atomic<idx_t> evict_queue_insertions;
-	//! Total dead nodes in the eviction queue. There are two scenarios in which a node dies: (1) we destroy its block
-	//! handle, or (2) we insert a newer version into the eviction queue.
-	atomic<idx_t> total_dead_nodes;
+	//! TODO: Set these based on memory limit and block sizes
+	//! TODO: Make static constexpr?
+	//! S3 Queue Sizes
+	idx_t PROBATIONARY_QUEUE_SIZE;
+	idx_t MAIN_QUEUE_SIZE;
+	idx_t GHOST_QUEUE_SIZE;
 
-	//! Locked, if a queue purge is currently active or we're trying to forcefully evict a node.
-	//! Only lets a single thread enter the purge phase.
+	//! Locked, if we're trying to forcefully evict a node.
+	//! Only lets a single thread enter the phase.
 	mutex purge_lock;
-	//! A pre-allocated vector of eviction nodes. We reuse this to keep the allocation overhead of purges small.
-	vector<BufferEvictionNode> purge_nodes;
 };
 
-bool EvictionQueue::AddToEvictionQueue(BufferEvictionNode &&node) {
-	q.enqueue(std::move(node));
-	return ++evict_queue_insertions % INSERT_INTERVAL == 0;
+S3FifoQueue::~S3FifoQueue() {
+    S3FifoNode node;
+    while (probationary_queue.try_dequeue(node)) {
+        // Ensure all resources are released
+        auto handle_p = node.handle.lock();
+        if (handle_p) {
+            handle_p->SetQueueType(S3FifoQueueType::NO_QUEUE);
+        }
+    }
+
+    while (main_queue.try_dequeue(node)) {
+        auto handle_p = node.handle.lock();
+        if (handle_p) {
+            handle_p->SetQueueType(S3FifoQueueType::NO_QUEUE);
+        }
+    }
+
+    while (ghost_queue.try_dequeue(node)) {
+        auto handle_p = node.handle.lock();
+        if (handle_p) {
+            handle_p->SetQueueType(S3FifoQueueType::NO_QUEUE);
+        }
+    }
+}
+ 
+bool S3FifoQueue::TryDequeueWithLock(S3FifoNode &node, S3FifoQueueType queue_type) {
+	lock_guard<mutex> l_lock(purge_lock);
+	switch (queue_type) {
+	case S3FifoQueueType::PROBATIONARY_QUEUE:
+		return probationary_queue.try_dequeue(node);
+	case S3FifoQueueType::MAIN_QUEUE:
+		return main_queue.try_dequeue(node);
+	case S3FifoQueueType::GHOST_QUEUE:
+		return ghost_queue.try_dequeue(node);
+	}
+
+	return false;
 }
 
-bool EvictionQueue::TryDequeueWithLock(BufferEvictionNode &node) {
-	lock_guard<mutex> lock(purge_lock);
-	return q.try_dequeue(node);
+//! TODO: Use locking in places 
+void S3FifoQueue::QueueInsert(shared_ptr<BlockHandle> handle) {
+	switch (handle->GetQueueType()) {
+	case S3FifoQueueType::NO_QUEUE:
+		ProbationaryQueueInsert(S3FifoNode(weak_ptr<BlockHandle>(handle)));
+		break;
+
+	case S3FifoQueueType::PROBATIONARY_QUEUE:
+	case S3FifoQueueType::MAIN_QUEUE:
+	 	//! TODO: Cap this
+		handle->IncrementAccesses();
+		break;
+	
+	case S3FifoQueueType::GHOST_QUEUE:
+		//! Move to main queue
+		MainQueueInsert(S3FifoNode(weak_ptr<BlockHandle>(handle)));
+		break;
+	}
 }
 
-void EvictionQueue::Purge() {
-	// only one thread purges the queue, all other threads early-out
-	if (!purge_lock.try_lock()) {
+bool S3FifoQueue::Evict() {
+	if (MainQueueEvict()) {
+		return true;
+	}
+	if (GhostQueueEvict()) {
+		return true;
+	}
+	return false;
+}
+
+void S3FifoQueue::ProbationaryQueueInsert(S3FifoNode &&node) {
+	//! TODO: Evict node if full
+	while (probationary_queue.size_approx() >= PROBATIONARY_QUEUE_SIZE) {
+		ProbationaryQueueEvict();
+	}
+
+	auto handle_p = node.handle.lock();
+	if (!handle_p) {
+		// BlockHandle has been destroyed
 		return;
 	}
-	lock_guard<mutex> lock {purge_lock, std::adopt_lock};
-
-	// we purge INSERT_INTERVAL * PURGE_SIZE_MULTIPLIER nodes
-	idx_t purge_size = INSERT_INTERVAL * PURGE_SIZE_MULTIPLIER;
-
-	// get an estimate of the queue size as-of now
-	idx_t approx_q_size = q.size_approx();
-
-	// early-out, if the queue is not big enough to justify purging
-	// - we want to keep the LRU characteristic alive
-	if (approx_q_size < purge_size * EARLY_OUT_MULTIPLIER) {
-		return;
-	}
-
-	// There are two types of situations.
-
-	// For most scenarios, purging INSERT_INTERVAL * PURGE_SIZE_MULTIPLIER nodes is enough.
-	// Purging more nodes than we insert also counters oscillation for scenarios where most nodes are dead.
-	// If we always purge slightly more, we trigger a purge less often, as we purge below the trigger.
-
-	// However, if the pressure on the queue becomes too contested, we need to purge more aggressively,
-	// i.e., we actively seek a specific number of dead nodes to purge. We use the total number of existing dead nodes.
-	// We detect this situation by observing the queue's ratio between alive vs. dead nodes. If the ratio of alive vs.
-	// dead nodes grows faster than we can purge, we keep purging until we hit one of the following conditions.
-
-	// 2.1. We're back at an approximate queue size less than purge_size * EARLY_OUT_MULTIPLIER.
-	// 2.2. We're back at a ratio of 1*alive_node:ALIVE_NODE_MULTIPLIER*dead_nodes.
-	// 2.3. We've purged the entire queue: max_purges is zero. This is a worst-case scenario,
-	// guaranteeing that we always exit the loop.
-
-	idx_t max_purges = approx_q_size / purge_size;
-	while (max_purges != 0) {
-		PurgeIteration(purge_size);
-
-		// update relevant sizes and potentially early-out
-		approx_q_size = q.size_approx();
-
-		// early-out according to (2.1)
-		if (approx_q_size < purge_size * EARLY_OUT_MULTIPLIER) {
-			break;
-		}
-
-		idx_t approx_dead_nodes = total_dead_nodes;
-		approx_dead_nodes = approx_dead_nodes > approx_q_size ? approx_q_size : approx_dead_nodes;
-		idx_t approx_alive_nodes = approx_q_size - approx_dead_nodes;
-
-		// early-out according to (2.2)
-		if (approx_alive_nodes * (ALIVE_NODE_MULTIPLIER - 1) > approx_dead_nodes) {
-			break;
-		}
-
-		max_purges--;
-	}
+	
+	// Reset access frequency
+	handle_p->ResetAccesses();
+	probationary_queue.enqueue(std::move(node));
 }
 
-void EvictionQueue::PurgeIteration(const idx_t purge_size) {
-	// if this purge is significantly smaller or bigger than the previous purge, then
-	// we need to resize the purge_nodes vector. Note that this barely happens, as we
-	// purge queue_insertions * PURGE_SIZE_MULTIPLIER nodes
-	idx_t previous_purge_size = purge_nodes.size();
-	if (purge_size < previous_purge_size / 2 || purge_size > previous_purge_size) {
-		purge_nodes.resize(purge_size);
+void S3FifoQueue::MainQueueInsert(S3FifoNode &&node, uint8_t default_accesses) {
+	//! TODO: Evict node if full
+	while (main_queue.size_approx() >= MAIN_QUEUE_SIZE) {
+		MainQueueEvict();
 	}
 
-	// bulk purge
-	idx_t actually_dequeued = q.try_dequeue_bulk(purge_nodes.begin(), purge_size);
+	//! Get a reference to the underlying block pointer
+	auto handle_p = node.handle.lock();
+	if (!handle_p) {
+		// BlockHandle has been destroyed
+		return;
+	}
+	
+	handle_p->SetQueueType(S3FifoQueueType::MAIN_QUEUE);
 
-	// retrieve all alive nodes that have been wrongly dequeued
-	idx_t alive_nodes = 0;
-	for (idx_t i = 0; i < actually_dequeued; i++) {
-		auto &node = purge_nodes[i];
-		auto handle = node.TryGetBlockHandle();
-		if (handle) {
-			q.enqueue(std::move(node));
-			alive_nodes++;
+	// Reset access frequency
+	if (default_accesses > 0) {
+		handle_p->SetAccesses(default_accesses);
+	} else {
+		handle_p->ResetAccesses();
+	}
+	// handle_p->SetAccesses(default_accesses);
+	main_queue.enqueue(std::move(node));
+}
+
+void S3FifoQueue::GhostQueueInsert(S3FifoNode &&node) {
+	//! TODO: Evict node if full
+	while (ghost_queue.size_approx() >= GHOST_QUEUE_SIZE) {
+		GhostQueueEvict();
+	}
+
+	//! Get a reference to the underlying block pointer
+	auto handle_p = node.handle.lock();
+	if (!handle_p) {
+		// BlockHandle has been destroyed
+		return;
+	}
+	
+	handle_p->SetQueueType(S3FifoQueueType::GHOST_QUEUE);
+
+	// Reset access frequency
+	handle_p->ResetAccesses();
+	ghost_queue.enqueue(std::move(node));
+}
+
+bool S3FifoQueue::ProbationaryQueueEvict() {
+	S3FifoNode node;
+	if (!probationary_queue.try_dequeue(node)) {
+		// if (!TryDequeueWithLock(node, S3FifoQueueType::PROBATIONARY_QUEUE)) {
+		// 	return false;
+		// }
+		return false;
+	}
+
+	//! Get a reference to the underlying block pointer
+	auto handle_p = node.handle.lock();
+	if (!handle_p) {
+		// BlockHandle has been destroyed
+		return true;
+	}
+
+	handle_p->SetQueueType(S3FifoQueueType::PROBATIONARY_QUEUE);
+
+	// Check the node access frequency
+	auto accesses = handle_p->GetAccesses();
+	if (accesses > 0) {
+		// Move to main queue
+		MainQueueInsert(std::move(node));
+	} else {
+		// Move to ghost queue
+		GhostQueueInsert(std::move(node));
+	}
+
+	return true;
+}
+
+bool S3FifoQueue::MainQueueEvict() {
+	while (true) {
+		S3FifoNode node;
+		if (!main_queue.try_dequeue(node)) {
+			// if (!TryDequeueWithLock(node, S3FifoQueueType::MAIN_QUEUE)) {
+			// 	return false;
+			// }
+			return false;
 		}
+
+		//! Get a reference to the underlying block pointer
+		auto handle_p = node.handle.lock();
+		if (!handle_p) {
+			// BlockHandle has been destroyed
+			return true;
+		}
+
+		//! TODO: Modify CanUnload
+		//! Grab the mutex and check if we can free the block
+		auto lock = handle_p->GetLock();
+		
+		if (handle_p->IsUnloaded()) {
+			return true;
+		}
+
+		auto accesses = handle_p->GetAccesses();
+		if (!handle_p->CanUnload()) {
+			if (accesses == 0) {
+				accesses = 1;
+			}
+			//! Lazy promotion
+			MainQueueInsert(std::move(node), accesses - 1);
+			continue;
+		}
+
+		if (main_queue.size_approx() > MAIN_QUEUE_SIZE - 100 && handle_p->MustWriteToTemporaryFile()) {
+			// this block refers to temporary in-memory data
+			// this block cannot be destroyed upon evict/unpin
+			// in order to unload this block we need to write it to a temporary buffer
+			handle_p->Unload(lock);
+			return true;
+		}
+
+		// ! Check the node access frequency
+		if (accesses > 0) {
+			//! Lazy promotion
+			MainQueueInsert(std::move(node), accesses - 1);
+			continue;
+		}
+
+		//! TODO: Modify Unload if necessary
+		//! Release the memory and mark the block as unloaded
+		handle_p->Unload(lock);
+		return true;
 	}
 
-	total_dead_nodes -= actually_dequeued - alive_nodes;
+	return false;
+}
+
+bool S3FifoQueue::GhostQueueEvict() {
+	S3FifoNode node;
+	if (!ghost_queue.try_dequeue(node)) {
+		// if (!TryDequeueWithLock(node, S3FifoQueueType::GHOST_QUEUE)) {
+		// 	return false;
+		// }
+		return false;
+	}
+
+	//! Get a reference to the underlying block pointer
+	auto handle_p = node.handle.lock();
+	if (!handle_p) {
+		// BlockHandle has been destroyed
+		return true;
+	}
+
+	// if (handle_p->GetQueueType() == S3FifoQueueType::MAIN_QUEUE) {
+	// 	return true;
+	// }
+
+	//! TODO: Modify CanUnload
+	//! Grab the mutex and check if we can free the block
+	auto lock = handle_p->GetLock();
+	if (handle_p->IsUnloaded()) {
+		return true;
+	}
+
+	// D_ASSERT(handle_p->CanUnload());
+	if (!handle_p->CanUnload()) {
+		// if (handle_p->GetQueueType() == S3FifoQueueType::GHOST_QUEUE) {
+		// 	handle_p->SetQueueType(S3FifoQueueType::NO_QUEUE);
+		// }
+		// //! Keep in buffer pool
+		// QueueInsert(handle_p);
+		return true;
+	}
+
+	//! TODO: Modify Unload if necessary
+	//! Release the memory and mark the block as unloaded
+	handle_p->Unload(lock);
+
+	return true;
 }
 
 BufferPool::BufferPool(idx_t maximum_memory, bool track_eviction_timestamps,
                        idx_t allocator_bulk_deallocation_flush_threshold)
-    : eviction_queue_sizes({BLOCK_QUEUE_SIZE, MANAGED_BUFFER_QUEUE_SIZE, TINY_BUFFER_QUEUE_SIZE}),
-      maximum_memory(maximum_memory),
+    : maximum_memory(maximum_memory),
       allocator_bulk_deallocation_flush_threshold(allocator_bulk_deallocation_flush_threshold),
       track_eviction_timestamps(track_eviction_timestamps),
       temporary_memory_manager(make_uniq<TemporaryMemoryManager>()) {
 	for (uint8_t type_idx = 0; type_idx < FILE_BUFFER_TYPE_COUNT; type_idx++) {
 		const auto type = static_cast<FileBufferType>(type_idx + 1);
-		const auto &type_queue_size = eviction_queue_sizes[type_idx];
-		for (idx_t queue_idx = 0; queue_idx < type_queue_size; queue_idx++) {
-			queues.push_back(make_uniq<EvictionQueue>(type));
-		}
+		fifo_queues.push_back(make_uniq<S3FifoQueue>(type, maximum_memory));
 	}
 }
 BufferPool::~BufferPool() {
 }
-
-bool BufferPool::AddToEvictionQueue(shared_ptr<BlockHandle> &handle) {
-	auto &queue = GetEvictionQueueForBlockHandle(*handle);
-
-	// The block handle is locked during this operation (Unpin),
-	// or the block handle is still a local variable (ConvertToPersistent)
-	D_ASSERT(handle->Readers() == 0);
-	auto ts = handle->NextEvictionSequenceNumber();
-	if (track_eviction_timestamps) {
-		handle->SetLRUTimestamp(
-		    std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
-		        .time_since_epoch()
-		        .count());
-	}
-
-	if (ts != 1) {
-		// we add a newer version, i.e., we kill exactly one previous version
-		queue.IncrementDeadNodes();
-	}
-
-	// Get the eviction queue for the block and add it
-	return queue.AddToEvictionQueue(BufferEvictionNode(weak_ptr<BlockHandle>(handle), ts));
+ 
+void BufferPool::AddToQueue(shared_ptr<BlockHandle> &handle) {
+	auto &queue = GetS3FifoQueueForBlockHandle(*handle);
+	queue.QueueInsert(handle);
 }
 
-EvictionQueue &BufferPool::GetEvictionQueueForBlockHandle(const BlockHandle &handle) {
+S3FifoQueue &BufferPool::GetS3FifoQueueForBlockHandle(const BlockHandle &handle) {
 	const auto &handle_buffer_type = handle.GetBufferType();
 
 	// Get offset into eviction queues for this FileBufferType
-	idx_t queue_index = 0;
 	for (uint8_t type_idx = 0; type_idx < FILE_BUFFER_TYPE_COUNT; type_idx++) {
 		const auto queue_buffer_type = static_cast<FileBufferType>(type_idx + 1);
 		if (handle_buffer_type == queue_buffer_type) {
-			break;
+			return *fifo_queues[type_idx];
 		}
-		const auto &type_queue_size = eviction_queue_sizes[type_idx];
-		queue_index += type_queue_size;
 	}
 
-	const auto &queue_size = eviction_queue_sizes[static_cast<uint8_t>(handle_buffer_type) - 1];
-	// Adjust if eviction_queue_idx is set (idx == 0 -> add at back, idx >= queue_size -> add at front)
-	auto eviction_queue_idx = handle.GetEvictionQueueIndex();
-	if (eviction_queue_idx < queue_size) {
-		queue_index += queue_size - eviction_queue_idx - 1;
-	}
-
-	D_ASSERT(queues[queue_index]->file_buffer_type == handle_buffer_type);
-	return *queues[queue_index];
-}
-
-void BufferPool::IncrementDeadNodes(const BlockHandle &handle) {
-	GetEvictionQueueForBlockHandle(handle).IncrementDeadNodes();
+	D_ASSERT(false);
 }
 
 void BufferPool::UpdateUsedMemory(MemoryTag tag, int64_t size) {
@@ -289,17 +391,21 @@ TemporaryMemoryManager &BufferPool::GetTemporaryMemoryManager() {
 
 BufferPool::EvictionResult BufferPool::EvictBlocks(MemoryTag tag, idx_t extra_memory, idx_t memory_limit,
                                                    unique_ptr<FileBuffer> *buffer) {
-	for (auto &queue : queues) {
+	for (auto &queue : fifo_queues) {
+		//! TODO: Check code
 		auto block_result = EvictBlocksInternal(*queue, tag, extra_memory, memory_limit, buffer);
-		if (block_result.success || RefersToSameObject(*queue, *queues.back())) {
+		if (block_result.success || RefersToSameObject(*queue, *fifo_queues.back())) {
 			return block_result; // Return upon success or upon last queue
 		}
 	}
+
 	// This can never happen since we always return when i == 1. Exception to silence compiler warning
 	throw InternalException("Exited BufferPool::EvictBlocksInternal without obtaining BufferPool::EvictionResult");
 }
 
-BufferPool::EvictionResult BufferPool::EvictBlocksInternal(EvictionQueue &queue, MemoryTag tag, idx_t extra_memory,
+//! TODO: Do we need extra_memory == freed block exactly optimization
+//! TODO: Should the logic be amended for individual file buffer types?
+BufferPool::EvictionResult BufferPool::EvictBlocksInternal(S3FifoQueue &queue, MemoryTag tag, idx_t extra_memory,
                                                            idx_t memory_limit, unique_ptr<FileBuffer> *buffer) {
 	TempBufferPoolReservation r(tag, *this, extra_memory);
 	bool found = false;
@@ -311,26 +417,18 @@ BufferPool::EvictionResult BufferPool::EvictBlocksInternal(EvictionQueue &queue,
 		return {true, std::move(r)};
 	}
 
-	queue.IterateUnloadableBlocks([&](BufferEvictionNode &, const shared_ptr<BlockHandle> &handle, BlockLock &lock) {
-		// hooray, we can unload the block
-		if (buffer && handle->GetBuffer(lock)->AllocSize() == extra_memory) {
-			// we can re-use the memory directly
-			*buffer = handle->UnloadAndTakeBlock(lock);
-			found = true;
-			return false;
-		}
-
-		// release the memory and mark the block as unloaded
-		handle->Unload(lock);
+	while (true) {
+		auto evicted = queue.Evict();
 
 		if (memory_usage.GetUsedMemory(MemoryUsageCaches::NO_FLUSH) <= memory_limit) {
 			found = true;
-			return false;
+			break;
 		}
 
-		// Continue iteration
-		return true;
-	});
+		if (!evicted) {
+			break;
+		}
+	}
 
 	if (!found) {
 		r.Resize(0);
@@ -341,75 +439,10 @@ BufferPool::EvictionResult BufferPool::EvictBlocksInternal(EvictionQueue &queue,
 	return {found, std::move(r)};
 }
 
-idx_t BufferPool::PurgeAgedBlocks(uint32_t max_age_sec) {
-	int64_t now = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())
-	                  .time_since_epoch()
-	                  .count();
-	int64_t limit = now - (static_cast<int64_t>(max_age_sec) * 1000);
-	idx_t purged_bytes = 0;
-	for (auto &queue : queues) {
-		purged_bytes += PurgeAgedBlocksInternal(*queue, max_age_sec, now, limit);
-	}
-	return purged_bytes;
-}
-
-idx_t BufferPool::PurgeAgedBlocksInternal(EvictionQueue &queue, uint32_t max_age_sec, int64_t now, int64_t limit) {
-	idx_t purged_bytes = 0;
-	queue.IterateUnloadableBlocks(
-	    [&](BufferEvictionNode &node, const shared_ptr<BlockHandle> &handle, BlockLock &lock) {
-		    // We will unload this block regardless. But stop the iteration immediately afterward if this
-		    // block is younger than the age threshold.
-		    auto lru_timestamp_msec = handle->GetLRUTimestamp();
-		    bool is_fresh = lru_timestamp_msec >= limit && lru_timestamp_msec <= now;
-		    purged_bytes += handle->GetMemoryUsage();
-		    handle->Unload(lock);
-		    // Return false to stop iterating if the current block is_fresh
-		    return !is_fresh;
-	    });
-	return purged_bytes;
-}
-
-template <typename FN>
-void EvictionQueue::IterateUnloadableBlocks(FN fn) {
-	for (;;) {
-		// get a block to unpin from the queue
-		BufferEvictionNode node;
-		if (!q.try_dequeue(node)) {
-			// we could not dequeue any eviction node, so we try one more time,
-			// but more aggressively
-			if (!TryDequeueWithLock(node)) {
-				return;
-			}
-		}
-
-		// get a reference to the underlying block pointer
-		auto handle = node.TryGetBlockHandle();
-		if (!handle) {
-			DecrementDeadNodes();
-			continue;
-		}
-
-		// we might be able to free this block: grab the mutex and check if we can free it
-		auto lock = handle->GetLock();
-		if (!node.CanUnload(*handle)) {
-			// something changed in the mean-time, bail out
-			DecrementDeadNodes();
-			continue;
-		}
-
-		if (!fn(node, handle, lock)) {
-			break;
-		}
-	}
-}
-
-void BufferPool::PurgeQueue(const BlockHandle &block) {
-	GetEvictionQueueForBlockHandle(block).Purge();
-}
-
 void BufferPool::SetLimit(idx_t limit, const char *exception_postscript) {
 	lock_guard<mutex> l_lock(limit_lock);
 	// try to evict until the limit is reached
+	//! TODO: Resize queues based on memory limit
 	if (!EvictBlocks(MemoryTag::EXTENSION, 0, limit).success) {
 		throw OutOfMemoryException(
 		    "Failed to change memory limit to %lld: could not free up enough memory for the new limit%s", limit,

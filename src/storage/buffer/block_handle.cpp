@@ -36,12 +36,7 @@ BlockHandle::~BlockHandle() { // NOLINT: allow internal exceptions
 	// being destroyed, so any unswizzled pointers are just binary junk now.
 	unswizzled = nullptr;
 	D_ASSERT(!buffer || buffer->GetBufferType() == buffer_type);
-	if (buffer && buffer_type != FileBufferType::TINY_BUFFER) {
-		// we kill the latest version in the eviction queue
-		auto &buffer_manager = block_manager.buffer_manager;
-		buffer_manager.GetBufferPool().IncrementDeadNodes(*this);
-	}
-
+	
 	// no references remain to this block: erase
 	if (buffer && state == BlockState::BLOCK_LOADED) {
 		D_ASSERT(memory_charge.size > 0);
@@ -154,6 +149,8 @@ BufferHandle BlockHandle::Load(unique_ptr<FileBuffer> reusable_buffer) {
 	}
 	state = BlockState::BLOCK_LOADED;
 	readers = 1;
+	accesses = 0;
+	queue_type = S3FifoQueueType::NO_QUEUE;
 	return BufferHandle(shared_from_this(), buffer.get());
 }
 
@@ -173,6 +170,8 @@ unique_ptr<FileBuffer> BlockHandle::UnloadAndTakeBlock(BlockLock &lock) {
 	}
 	memory_charge.Resize(0);
 	state = BlockState::BLOCK_UNLOADED;
+	queue_type = S3FifoQueueType::NO_QUEUE;
+	accesses = 0;
 	return std::move(buffer);
 }
 

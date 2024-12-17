@@ -55,6 +55,8 @@ struct TempBufferPoolReservation : BufferPoolReservation {
 	}
 };
 
+enum class S3FifoQueueType : uint8_t { GHOST_QUEUE, MAIN_QUEUE, PROBATIONARY_QUEUE, NO_QUEUE };
+
 using BlockLock = unique_lock<mutex>;
 
 class BlockHandle : public enable_shared_from_this<BlockHandle> {
@@ -102,10 +104,6 @@ public:
 		destroy_buffer_upon = destroy_buffer_upon_p;
 	}
 
-	inline bool MustAddToEvictionQueue() const {
-		return destroy_buffer_upon != DestroyBufferUpon::UNPIN;
-	}
-
 	inline bool MustWriteToTemporaryFile() const {
 		return destroy_buffer_upon == DestroyBufferUpon::BLOCK;
 	}
@@ -128,6 +126,37 @@ public:
 
 	idx_t GetEvictionQueueIndex() const {
 		return eviction_queue_idx;
+	}
+
+	uint8_t GetAccesses() {
+		return accesses;
+	}
+
+	uint8_t IncrementAccesses() {
+		uint8_t current_accesses = accesses.load();
+		while (current_accesses < 3) {
+			uint8_t new_accesses = std::min(current_accesses + 1, 3);
+			if (accesses.compare_exchange_weak(current_accesses, new_accesses)) {
+				return accesses;
+			}
+		}
+		return accesses;
+	}
+
+	void SetAccesses(const uint8_t accesses_p) {
+		accesses = accesses_p;
+	}
+
+	void ResetAccesses() {
+		accesses = 0;
+	}
+
+	S3FifoQueueType GetQueueType() const {
+		return queue_type;
+	}
+
+	void SetQueueType(S3FifoQueueType queue_type_p) {
+		queue_type = queue_type_p;
 	}
 
 	FileBufferType GetBufferType() const {
@@ -208,6 +237,11 @@ private:
 	const char *unswizzled;
 	//! Index for eviction queue (FileBufferType::MANAGED_BUFFER only, for now)
 	atomic<idx_t> eviction_queue_idx;
+	//! TODO: Does this need to be atomic
+	//! The number of accesses to the block in the queues
+	atomic<uint8_t> accesses;
+	// S3 FIFO Queue state
+	S3FifoQueueType queue_type = S3FifoQueueType::NO_QUEUE;
 };
 
 } // namespace duckdb

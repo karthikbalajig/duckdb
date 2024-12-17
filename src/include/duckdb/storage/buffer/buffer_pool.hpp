@@ -8,17 +8,21 @@
 
 #pragma once
 
+#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/array.hpp"
 #include "duckdb/common/enums/memory_tag.hpp"
 #include "duckdb/common/file_buffer.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/storage/buffer/block_handle.hpp"
+#include "duckdb/common/typedefs.hpp"
+#include "duckdb/parallel/concurrentqueue.hpp"
 
 namespace duckdb {
 
 class TemporaryMemoryManager;
 struct EvictionQueue;
+struct S3FifoQueue;
 
 struct BufferEvictionNode {
 	BufferEvictionNode() {
@@ -30,6 +34,17 @@ struct BufferEvictionNode {
 
 	bool CanUnload(BlockHandle &handle_p);
 	shared_ptr<BlockHandle> TryGetBlockHandle();
+};
+
+struct S3FifoNode {
+	S3FifoNode() {
+	}
+	S3FifoNode(weak_ptr<BlockHandle> handle);
+
+	//! TODO: Include state to know which queue the node is in
+	//! TODO: Can probably combine accesses into 1 variable
+	//! Weak pointer to the corresponding block handle
+	weak_ptr<BlockHandle> handle;
 };
 
 //! The BufferPool is in charge of handling memory management for one or more databases. It defines memory limits
@@ -75,28 +90,13 @@ protected:
 	};
 	virtual EvictionResult EvictBlocks(MemoryTag tag, idx_t extra_memory, idx_t memory_limit,
 	                                   unique_ptr<FileBuffer> *buffer = nullptr);
-	virtual EvictionResult EvictBlocksInternal(EvictionQueue &queue, MemoryTag tag, idx_t extra_memory,
+	virtual EvictionResult EvictBlocksInternal(S3FifoQueue &queue, MemoryTag tag, idx_t extra_memory,
 	                                           idx_t memory_limit, unique_ptr<FileBuffer> *buffer = nullptr);
 
-	//! Purge all blocks that haven't been pinned within the last N seconds
-	idx_t PurgeAgedBlocks(uint32_t max_age_sec);
-	idx_t PurgeAgedBlocksInternal(EvictionQueue &queue, uint32_t max_age_sec, int64_t now, int64_t limit);
-	//! Garbage collect dead nodes in the eviction queue.
-	void PurgeQueue(const BlockHandle &handle);
-	//! Add a buffer handle to the eviction queue. Returns true, if the queue is
-	//! ready to be purged, and false otherwise.
-	bool AddToEvictionQueue(shared_ptr<BlockHandle> &handle);
-	//! Gets the eviction queue for the specified type
-	EvictionQueue &GetEvictionQueueForBlockHandle(const BlockHandle &handle);
-	//! Increments the dead nodes for the queue with specified type
-	void IncrementDeadNodes(const BlockHandle &handle);
-
-	//! How many eviction queues we have for the different FileBufferTypes
-	static constexpr idx_t BLOCK_QUEUE_SIZE = 1;
-	static constexpr idx_t MANAGED_BUFFER_QUEUE_SIZE = 6;
-	static constexpr idx_t TINY_BUFFER_QUEUE_SIZE = 1;
-	//! Mapping and priority order for the eviction queues
-	const array<idx_t, FILE_BUFFER_TYPE_COUNT> eviction_queue_sizes;
+	//! Add a buffer handle to the S3 FIFO queue, based on its buffer type
+	void AddToQueue(shared_ptr<BlockHandle> &handle);
+	//! Gets the S3 FIFO queue for the specified type
+	S3FifoQueue &GetS3FifoQueueForBlockHandle(const BlockHandle &handle);
 
 protected:
 	enum class MemoryUsageCaches {
@@ -150,8 +150,8 @@ protected:
 	atomic<idx_t> allocator_bulk_deallocation_flush_threshold;
 	//! Record timestamps of buffer manager unpin() events. Usable by custom eviction policies.
 	bool track_eviction_timestamps;
-	//! Eviction queues
-	vector<unique_ptr<EvictionQueue>> queues;
+	//! S3 FIFO queues
+	vector<unique_ptr<S3FifoQueue>> fifo_queues;
 	//! Memory manager for concurrently used temporary memory, e.g., for physical operators
 	unique_ptr<TemporaryMemoryManager> temporary_memory_manager;
 	//! To improve performance, MemoryUsage maintains counter caches based on current cpu or thread id,

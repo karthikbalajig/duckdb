@@ -119,9 +119,6 @@ protected:
 	//! blocks that are never pinned are never added to the eviction queue
 	shared_ptr<BlockHandle> RegisterMemory(MemoryTag tag, idx_t block_size, bool can_destroy);
 
-	//! Garbage collect eviction queue
-	void PurgeQueue(const BlockHandle &handle) final;
-
 	BufferPool &GetBufferPool() const final;
 	TemporaryMemoryManager &GetTemporaryMemoryManager() final;
 
@@ -136,8 +133,6 @@ protected:
 	void DeleteTemporaryFile(BlockHandle &block) final;
 
 	void RequireTemporaryDirectory();
-
-	void AddToEvictionQueue(shared_ptr<BlockHandle> &handle) final;
 
 	const char *InMemoryWarning();
 
