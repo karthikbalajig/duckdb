@@ -268,7 +268,7 @@ bool S3FifoQueue::MainQueueEvict() {
 			continue;
 		}
 
-		if (main_queue.size_approx() > 9 * MAIN_QUEUE_SIZE / 10 && handle_p->MustWriteToTemporaryFile()) {
+		if (main_queue.size_approx() > MAIN_QUEUE_SIZE - 100 && handle_p->MustWriteToTemporaryFile()) {
 			// this block refers to temporary in-memory data
 			// this block cannot be destroyed upon evict/unpin
 			// in order to unload this block we need to write it to a temporary buffer
